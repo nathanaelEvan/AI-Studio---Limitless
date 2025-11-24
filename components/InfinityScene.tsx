@@ -19,7 +19,48 @@ interface ProjectileData {
   active: boolean;
   color: string;
   scale?: number;
+  age: number;
 }
+
+// --- SPECIALIZED VISUALS FOR HOLLOW PURPLE ---
+// Just the vortex particles now, not replacing the core
+const PurpleVortex = ({ theme }: { theme: 'dark' | 'light' }) => {
+  const particlesRef = useRef<THREE.Points>(null);
+
+  // Generate vortex particles
+  const particleGeo = useMemo(() => {
+    const geo = new THREE.BufferGeometry();
+    const count = 300;
+    const positions = new Float32Array(count * 3);
+    for (let i = 0; i < count; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const radius = 2.0 + Math.random() * 3; // Wider spread
+        // Flat disk-ish distribution
+        positions[i * 3] = Math.cos(angle) * radius;
+        positions[i * 3 + 1] = (Math.random() - 0.5) * 1.0; 
+        positions[i * 3 + 2] = Math.sin(angle) * radius;
+    }
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    return geo;
+  }, []);
+
+  useFrame((state, delta) => {
+    const t = state.clock.elapsedTime;
+    if (particlesRef.current) {
+        particlesRef.current.rotation.y = t * 2.0; // Fast vortex spin
+    }
+  });
+
+  return (
+    <group>
+        {/* Vortex Debris */}
+        <points ref={particlesRef} geometry={particleGeo}>
+            <pointsMaterial color={theme === 'dark' ? "#d8b4fe" : "#7e22ce"} size={0.08} transparent opacity={0.6} sizeAttenuation={true} />
+        </points>
+    </group>
+  );
+};
+
 
 // Represents the "Barrier" of Infinity
 const Barrier = ({ technique, theme }: { technique: TechniqueType, theme: 'dark' | 'light' }) => {
@@ -61,11 +102,14 @@ const Barrier = ({ technique, theme }: { technique: TechniqueType, theme: 'dark'
           metalness={1}
         />
       </mesh>
-      {/* Core */}
+      {/* Core Sphere - Always present now */}
       <mesh scale={[0.5, 0.5, 0.5]}>
         <sphereGeometry args={[1, 32, 32]} />
         <meshBasicMaterial color={color} transparent opacity={0.8} />
       </mesh>
+
+      {/* Conditional Vortex for Purple */}
+      {technique === TechniqueType.PURPLE && <PurpleVortex theme={theme} />}
     </group>
   );
 };
@@ -159,7 +203,8 @@ const DynamicProjectiles = ({
             velocity: direction.multiplyScalar(speed), // Initial velocity
             active: true,
             color: projColor,
-            scale: 1
+            scale: 1,
+            age: 0
           }];
         });
 
@@ -176,10 +221,8 @@ const DynamicProjectiles = ({
       // PRE-CALCULATION for Blue Logic: Count trapped objects
       let trappedCount = 0;
       if (technique === TechniqueType.BLUE) {
-        // Approximate count using simple loop for performance
         const len = prev.length;
         for (let i = 0; i < len; i++) {
-            // Check if active and within "core" radius approx
             if (prev[i].active && prev[i].position.lengthSq() < 6.25) { // 2.5^2
                 trappedCount++;
             }
@@ -201,6 +244,7 @@ const DynamicProjectiles = ({
         const dist = Math.sqrt(distSq);
         let currentScale = p.scale ?? 1;
         let active: boolean = p.active;
+        const currentAge = p.age + safeDelta;
         
         // IMPORTANT: Clone velocity to avoid mutating state directly
         const currentVelocity = p.velocity.clone();
@@ -240,7 +284,7 @@ const DynamicProjectiles = ({
             }
           }
         } else if (technique === TechniqueType.BLUE) {
-          // REVAMPED BLUE: Ganking / Accumulation Logic
+          // BLUE LOGIC: Ganking / Accumulation
           const coreRadius = 2.0;
           const attractionRadius = 15.0; // Global pull
 
@@ -253,15 +297,12 @@ const DynamicProjectiles = ({
 
           if (dist < coreRadius + 1.0) {
             // 2. Trapping / Damping
-            // Heavily reduce velocity to keep them "stuck" but still moving slightly
             currentVelocity.multiplyScalar(0.85); 
             
             // DYNAMIC UNSTABLE SHAKING
-            // The closer to the core, the more violent the shaking
             const range = coreRadius + 1.0;
-            const closeness = Math.max(0, 1 - (dist / range)); // 0 at edge, 1 at center
+            const closeness = Math.max(0, 1 - (dist / range)); 
             
-            // Exponential curve for dramatic effect near the center
             const shakeIntensity = 0.05 + Math.pow(closeness, 4) * 0.6;
 
             moveVec.add(new THREE.Vector3(
@@ -272,13 +313,11 @@ const DynamicProjectiles = ({
           }
 
           // 3. Density-based Shrinking
-          // If we have enough bullets gathered, start shrinking them
           const shrinkThreshold = 8;
           if (trappedCount > shrinkThreshold && dist < coreRadius + 0.5) {
              const excess = trappedCount - shrinkThreshold;
-             // More bullets = faster shrink
              const shrinkFactor = 0.99 - (Math.min(excess, 50) * 0.005); 
-             currentScale *= Math.max(0.8, shrinkFactor); // Cap max shrink speed
+             currentScale *= Math.max(0.8, shrinkFactor); 
           }
 
           moveVec = currentVelocity.clone().multiplyScalar(safeDelta);
@@ -291,22 +330,14 @@ const DynamicProjectiles = ({
           const coreRadius = 1.5; 
 
           if (dist < repulsionRadius) {
-             // SAFEGUARD: Normalize check
              const dirOut = dist > 0.01 ? currentPos.clone().normalize() : new THREE.Vector3(1, 0, 0);
-             
              const approachSpeed = -currentVelocity.dot(dirOut);
-             
-             // Calculate depth
              const rawDepth = Math.max(0, (dist - coreRadius) / (repulsionRadius - coreRadius));
-             const depth = 1 - rawDepth; // 0 at edge, 1 at core
+             const depth = 1 - rawDepth; 
 
-             // Repulsion Curve
              const intensity = Math.pow(depth, 3); 
-
-             // 1. Static Repulsion
              const staticForce = 80 * intensity; 
              
-             // 2. Dynamic Reflection (Elasticity)
              let reflectionForce = 0;
              if (approachSpeed > 0) {
                 reflectionForce = approachSpeed * (1 + 40 * intensity); 
@@ -314,18 +345,13 @@ const DynamicProjectiles = ({
 
              const totalForce = (staticForce + reflectionForce) * safeDelta;
              
-             // SAFEGUARD: Prevent infinite forces
              if (!isNaN(totalForce) && isFinite(totalForce)) {
                 currentVelocity.add(dirOut.multiplyScalar(totalForce));
-                // Update moveVec to reflect the bounce immediately
                 moveVec = currentVelocity.clone().multiplyScalar(safeDelta);
              }
 
-             // 3. Absolute Hard Limit
              if (dist < coreRadius + 0.2) {
-                 // Force push out
                  const pushOut = dirOut.multiplyScalar(coreRadius + 0.2);
-                 // Adjust moveVec
                  moveVec.add(pushOut.sub(currentPos));
                  
                  if (approachSpeed > 0) {
@@ -335,32 +361,45 @@ const DynamicProjectiles = ({
              }
           }
         } else if (technique === TechniqueType.PURPLE) {
-          // OLD BLUE LOGIC (Crumble + Erase)
-          const safeDistSq = Math.max(0.1, distSq);
-          const pullStrength = 30 / (safeDistSq + 0.1);
+          // PURPLE LOGIC: CURVED SUCTION
+          // "Go straight into the core while curving"
           
-          const pullDir = dist > 0.1 ? currentPos.clone().normalize().negate() : new THREE.Vector3(0,0,0);
+          const inward = currentPos.clone().normalize().negate();
+          const up = new THREE.Vector3(0, 1, 0);
+          let tangent = new THREE.Vector3().crossVectors(up, currentPos).normalize();
+          if (tangent.lengthSq() < 0.001) tangent = new THREE.Vector3(1, 0, 0);
+
+          // Distance factor: Closer = Faster
+          const factor = Math.max(1, 15 - dist); 
+          const speed = 15 + factor * 2; // Base speed high + acceleration
+
+          // Combine Inward (dominant) and Tangent (curve)
+          // Ratio: 75% Inward, 25% Tangent for a swooping curve
+          const curveRatio = 0.25; 
+          const direction = inward.clone().multiplyScalar(1 - curveRatio)
+                            .add(tangent.multiplyScalar(curveRatio))
+                            .normalize();
           
-          currentVelocity.add(pullDir.multiplyScalar(pullStrength * safeDelta));
-          moveVec = currentVelocity.clone().multiplyScalar(safeDelta);
+          // Update velocity for visual trail accuracy
+          currentVelocity.copy(direction.multiplyScalar(speed));
 
-          // Core Crumbling and Shrinking
-          if (dist < 2.5) {
-             currentVelocity.multiplyScalar(0.92); 
-             moveVec.multiplyScalar(0.92);
+          // Shaking increases with proximity
+          const shakeIntensity = 0.5 + (10 - dist) * 0.2;
+          const jitter = new THREE.Vector3(
+             (Math.random() - 0.5) * shakeIntensity,
+             (Math.random() - 0.5) * shakeIntensity,
+             (Math.random() - 0.5) * shakeIntensity
+          );
 
-             const vibration = 0.2 * (1 - (dist / 2.5));
-             moveVec.add(new THREE.Vector3(
-                (Math.random() - 0.5) * vibration,
-                (Math.random() - 0.5) * vibration,
-                (Math.random() - 0.5) * vibration
-             ));
+          moveVec = currentVelocity.clone().multiplyScalar(safeDelta).add(jitter);
 
-             currentScale *= 0.92; // Fast shrink
+          // Shrink rapidly near center
+          if (dist < 3.0) {
+              currentScale *= 0.85;
           }
           
-          if (currentScale < 0.05) active = false;
-          if (dist < 0.5) active = false; 
+          // Death condition
+          if (currentScale < 0.05 || dist < 0.2) active = false;
         }
 
         const newPos = currentPos.add(moveVec);
@@ -374,7 +413,7 @@ const DynamicProjectiles = ({
             active = false;
         }
 
-        return { ...p, position: newPos, velocity: currentVelocity, active, scale: currentScale };
+        return { ...p, position: newPos, velocity: currentVelocity, active, scale: currentScale, age: currentAge };
       }).filter(p => p.active);
     });
   });
