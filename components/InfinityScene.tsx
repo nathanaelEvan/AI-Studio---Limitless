@@ -115,7 +115,7 @@ const Barrier = ({ technique, theme }: { technique: TechniqueType, theme: 'dark'
 };
 
 // Separate component to handle Trail lifecycle and avoid (0,0,0) glitch
-const Projectile = ({ data }: { data: ProjectileData }) => {
+const Projectile: React.FC<{ data: ProjectileData }> = ({ data }) => {
   const [trailVisible, setTrailVisible] = useState(false);
 
   useEffect(() => {
