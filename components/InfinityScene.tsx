@@ -1,4 +1,4 @@
-import React, { useRef, useMemo, useState, useEffect } from 'react';
+import React, { useRef, useMemo, useState, Suspense, useEffect } from 'react';
 import { Canvas, useFrame } from '@react-three/fiber';
 import { Stars, Trail, Text } from '@react-three/drei';
 import * as THREE from 'three';
@@ -6,8 +6,9 @@ import { TechniqueType } from '../types';
 
 interface InfinitySceneProps {
   technique: TechniqueType;
-  isAttacking: boolean;
-  onImpact: () => void;
+  spawnRate: number; // Attacks per second
+  minSpeed: number;
+  maxSpeed: number;
   theme: 'dark' | 'light';
 }
 
@@ -69,30 +70,141 @@ const Barrier = ({ technique, theme }: { technique: TechniqueType, theme: 'dark'
   );
 };
 
+// Separate component to handle Trail lifecycle and avoid (0,0,0) glitch
+const Projectile = ({ data }: { data: ProjectileData }) => {
+  const [trailVisible, setTrailVisible] = useState(false);
+
+  useEffect(() => {
+    // Delay trail activation to prevent the "straight line from center" glitch
+    // This ensures the mesh is at the spawn position before the Trail starts tracking
+    const timer = setTimeout(() => setTrailVisible(true), 100);
+    return () => clearTimeout(timer);
+  }, []);
+
+  return (
+    <mesh position={data.position} scale={data.scale ?? 1}>
+      <sphereGeometry args={[0.15, 16, 16]} />
+      <meshStandardMaterial color={data.color} emissive={data.color} emissiveIntensity={2} />
+      {trailVisible && (
+        <Trail 
+          width={0.5 * (data.scale ?? 1)} 
+          length={3} 
+          color={new THREE.Color(data.color)} 
+          attenuation={(t) => t * t}
+        >
+          <mesh visible={false} />
+        </Trail>
+      )}
+    </mesh>
+  );
+};
+
 const DynamicProjectiles = ({ 
   projectiles, 
   technique,
-  setProjectiles 
+  setProjectiles,
+  spawnRate,
+  minSpeed,
+  maxSpeed,
+  theme
 }: { 
   projectiles: ProjectileData[], 
   technique: TechniqueType,
-  setProjectiles: React.Dispatch<React.SetStateAction<ProjectileData[]>>
+  setProjectiles: React.Dispatch<React.SetStateAction<ProjectileData[]>>,
+  spawnRate: number,
+  minSpeed: number,
+  maxSpeed: number,
+  theme: 'dark' | 'light'
 }) => {
   
+  const timeSinceLastSpawn = useRef(0);
+  const nextSpawnInterval = useRef(0);
+
+  // Initialize random interval
+  if (nextSpawnInterval.current === 0) {
+    nextSpawnInterval.current = 1 / (spawnRate || 1);
+  }
+
   useFrame((state, delta) => {
+    // STABILITY: Clamp delta to avoid huge physics jumps on tab switch
+    const safeDelta = Math.min(delta, 0.1);
+
+    // --- Spawning Logic ---
+    if (spawnRate > 0) {
+      timeSinceLastSpawn.current += safeDelta;
+      
+      if (timeSinceLastSpawn.current >= nextSpawnInterval.current) {
+        // Spawn!
+        const angle = Math.random() * Math.PI * 2;
+        const radius = 14; // Start slightly further out
+        const startPos = new THREE.Vector3(
+          Math.cos(angle) * radius,
+          (Math.random() - 0.5) * 12,
+          Math.sin(angle) * radius
+        );
+        
+        // Safety check for startPos
+        if (isNaN(startPos.x)) startPos.set(radius, 0, 0);
+
+        const direction = new THREE.Vector3(0,0,0).sub(startPos).normalize();
+        const speed = minSpeed + Math.random() * (maxSpeed - minSpeed);
+        const projColor = theme === 'dark' ? '#fbbf24' : '#ef4444';
+
+        setProjectiles(prev => {
+          // Cap total objects for safety/performance
+          if (prev.length > 120) return prev; 
+          return [...prev, {
+            id: Date.now() + Math.random(),
+            position: startPos,
+            velocity: direction.multiplyScalar(speed), // Initial velocity
+            active: true,
+            color: projColor,
+            scale: 1
+          }];
+        });
+
+        // Reset timer and calculate next random interval
+        const baseInterval = 1 / spawnRate;
+        const variation = baseInterval * 0.3; 
+        nextSpawnInterval.current = baseInterval + (Math.random() * variation * 2 - variation);
+        timeSinceLastSpawn.current = 0;
+      }
+    }
+
+    // --- Physics Update ---
     setProjectiles(prev => {
-      const count = prev.length;
-      const isCrowded = count > 40;
+      // PRE-CALCULATION for Blue Logic: Count trapped objects
+      let trappedCount = 0;
+      if (technique === TechniqueType.BLUE) {
+        // Approximate count using simple loop for performance
+        const len = prev.length;
+        for (let i = 0; i < len; i++) {
+            // Check if active and within "core" radius approx
+            if (prev[i].active && prev[i].position.lengthSq() < 6.25) { // 2.5^2
+                trappedCount++;
+            }
+        }
+      }
+
+      const isCrowded = prev.length > 40;
 
       return prev.map(p => {
         if (!p.active) return p;
 
         const currentPos = p.position.clone();
-        const dist = currentPos.length();
+        // SAFEGUARD: Check for NaN in position immediately
+        if (isNaN(currentPos.x) || isNaN(currentPos.y) || isNaN(currentPos.z)) {
+           return { ...p, active: false };
+        }
+
+        const distSq = currentPos.lengthSq();
+        const dist = Math.sqrt(distSq);
         let currentScale = p.scale ?? 1;
+        let active: boolean = p.active;
         
-        // Physics Simulation based on Technique
-        let moveVec = p.velocity.clone().multiplyScalar(delta);
+        // IMPORTANT: Clone velocity to avoid mutating state directly
+        const currentVelocity = p.velocity.clone();
+        let moveVec = currentVelocity.clone().multiplyScalar(safeDelta);
 
         if (technique === TechniqueType.NEUTRAL) {
           // Zeno's Paradox
@@ -104,10 +216,10 @@ const DynamicProjectiles = ({
             const range = interactionRadius - stoppingRadius;
             const ratio = d / range; // 0 at barrier, 1 at outer edge of interaction
 
-            // Adjusted Curve: Power of 3 instead of 5 makes it less "wall-like" initially
+            // Adjusted Curve: Power of 3 for smooth but firm stop
             const speedFactor = Math.pow(ratio, 3);
             
-            // Apply speed reduction
+            // Apply speed reduction to movement vector
             moveVec.multiplyScalar(Math.max(0.0001, speedFactor));
 
             // VIBRATION LOGIC
@@ -122,85 +234,147 @@ const DynamicProjectiles = ({
 
             // PERFORMANCE: Shrink objects near the limit
             if (isCrowded) {
-                 // If crowded (performance mode), shrink aggressively to clear memory
-                 if (ratio < 0.5) {
-                     currentScale *= 0.90; 
-                 }
+                 if (ratio < 0.5) currentScale *= 0.90; 
             } else {
-                 // If not crowded (aesthetic mode), shrink very slowly to visualize the compression
-                 if (ratio < 0.1) {
-                     currentScale *= 0.995; 
-                 }
+                 if (ratio < 0.1) currentScale *= 0.995; 
             }
           }
         } else if (technique === TechniqueType.BLUE) {
-          // Attraction: Pull towards center
-          const pullStrength = 25 / (dist * dist + 0.1);
-          const pullDir = currentPos.clone().normalize().negate();
-          p.velocity.add(pullDir.multiplyScalar(pullStrength * delta));
+          // REVAMPED BLUE: Ganking / Accumulation Logic
+          const coreRadius = 2.0;
+          const attractionRadius = 15.0; // Global pull
 
-          // Core Acceleration - The Blue Effect
-          if (dist < 3) {
-              p.velocity.multiplyScalar(1.05); 
+          if (dist < attractionRadius) {
+            // 1. Strong Attraction
+            const pullDir = dist > 0.1 ? currentPos.clone().normalize().negate() : new THREE.Vector3(0,0,0);
+            const pullStrength = 20;
+            currentVelocity.add(pullDir.multiplyScalar(pullStrength * safeDelta));
           }
 
+          if (dist < coreRadius + 1.0) {
+            // 2. Trapping / Damping
+            // Heavily reduce velocity to keep them "stuck" but still moving slightly
+            currentVelocity.multiplyScalar(0.85); 
+            
+            // DYNAMIC UNSTABLE SHAKING
+            // The closer to the core, the more violent the shaking
+            const range = coreRadius + 1.0;
+            const closeness = Math.max(0, 1 - (dist / range)); // 0 at edge, 1 at center
+            
+            // Exponential curve for dramatic effect near the center
+            const shakeIntensity = 0.05 + Math.pow(closeness, 4) * 0.6;
+
+            moveVec.add(new THREE.Vector3(
+                (Math.random() - 0.5) * shakeIntensity,
+                (Math.random() - 0.5) * shakeIntensity,
+                (Math.random() - 0.5) * shakeIntensity
+            ));
+          }
+
+          // 3. Density-based Shrinking
+          // If we have enough bullets gathered, start shrinking them
+          const shrinkThreshold = 8;
+          if (trappedCount > shrinkThreshold && dist < coreRadius + 0.5) {
+             const excess = trappedCount - shrinkThreshold;
+             // More bullets = faster shrink
+             const shrinkFactor = 0.99 - (Math.min(excess, 50) * 0.005); 
+             currentScale *= Math.max(0.8, shrinkFactor); // Cap max shrink speed
+          }
+
+          moveVec = currentVelocity.clone().multiplyScalar(safeDelta);
+          
+          if (currentScale < 0.1) active = false;
+
         } else if (technique === TechniqueType.RED) {
-          // Repulsion: Push away from center
-          const repulsionRadius = 7; // Reduced slightly to allow closer visual approach before effect starts
-          const coreRadius = 2.0; // Inner limit where absolute rejection happens
+          // Red Physics: Bouncy Wall
+          const repulsionRadius = 4.5; 
+          const coreRadius = 1.5; 
 
           if (dist < repulsionRadius) {
-             const dirOut = currentPos.clone().normalize();
-             const approachSpeed = -p.velocity.dot(dirOut);
+             // SAFEGUARD: Normalize check
+             const dirOut = dist > 0.01 ? currentPos.clone().normalize() : new THREE.Vector3(1, 0, 0);
              
-             // Calculate depth factor (0 at edge, 1 at core)
-             // This allows easy entry at outer limits but ramps up resistance exponentially
+             const approachSpeed = -currentVelocity.dot(dirOut);
+             
+             // Calculate depth
              const rawDepth = Math.max(0, (dist - coreRadius) / (repulsionRadius - coreRadius));
-             const depth = 1 - rawDepth;
-             const intensity = Math.pow(depth, 3); // Cubic curve for smooth entry, violent rejection
+             const depth = 1 - rawDepth; // 0 at edge, 1 at core
 
-             // 1. Base Repulsion (Static Field)
-             // Low at edge (allows entry), high at core
-             const staticForce = 5 + (80 * intensity); 
+             // Repulsion Curve
+             const intensity = Math.pow(depth, 3); 
+
+             // 1. Static Repulsion
+             const staticForce = 80 * intensity; 
              
-             // 2. Dynamic Reflection
-             // Only strong when deep in the field
-             // "The faster they come, the faster they leave" - but mainly near the center
+             // 2. Dynamic Reflection (Elasticity)
              let reflectionForce = 0;
              if (approachSpeed > 0) {
                 reflectionForce = approachSpeed * (1 + 40 * intensity); 
              }
 
-             const totalForce = (staticForce + reflectionForce) * delta;
-             p.velocity.add(dirOut.multiplyScalar(totalForce));
+             const totalForce = (staticForce + reflectionForce) * safeDelta;
+             
+             // SAFEGUARD: Prevent infinite forces
+             if (!isNaN(totalForce) && isFinite(totalForce)) {
+                currentVelocity.add(dirOut.multiplyScalar(totalForce));
+                // Update moveVec to reflect the bounce immediately
+                moveVec = currentVelocity.clone().multiplyScalar(safeDelta);
+             }
 
-             // 3. Absolute Core Protection (Hard Bounce)
-             if (dist < coreRadius) {
-                 const currentSpeed = p.velocity.length();
-                 const newSpeed = Math.max(currentSpeed * 1.2, 25);
+             // 3. Absolute Hard Limit
+             if (dist < coreRadius + 0.2) {
+                 // Force push out
+                 const pushOut = dirOut.multiplyScalar(coreRadius + 0.2);
+                 // Adjust moveVec
+                 moveVec.add(pushOut.sub(currentPos));
                  
-                 if (approachSpeed > -2) {
-                    p.velocity = dirOut.multiplyScalar(newSpeed);
+                 if (approachSpeed > 0) {
+                    const currentSpeed = currentVelocity.length();
+                    currentVelocity.copy(dirOut.multiplyScalar(currentSpeed * 0.8));
                  }
              }
           }
         } else if (technique === TechniqueType.PURPLE) {
-          // Erasure
-          p.velocity.multiplyScalar(1.01);
+          // OLD BLUE LOGIC (Crumble + Erase)
+          const safeDistSq = Math.max(0.1, distSq);
+          const pullStrength = 30 / (safeDistSq + 0.1);
+          
+          const pullDir = dist > 0.1 ? currentPos.clone().normalize().negate() : new THREE.Vector3(0,0,0);
+          
+          currentVelocity.add(pullDir.multiplyScalar(pullStrength * safeDelta));
+          moveVec = currentVelocity.clone().multiplyScalar(safeDelta);
+
+          // Core Crumbling and Shrinking
+          if (dist < 2.5) {
+             currentVelocity.multiplyScalar(0.92); 
+             moveVec.multiplyScalar(0.92);
+
+             const vibration = 0.2 * (1 - (dist / 2.5));
+             moveVec.add(new THREE.Vector3(
+                (Math.random() - 0.5) * vibration,
+                (Math.random() - 0.5) * vibration,
+                (Math.random() - 0.5) * vibration
+             ));
+
+             currentScale *= 0.92; // Fast shrink
+          }
+          
+          if (currentScale < 0.05) active = false;
+          if (dist < 0.5) active = false; 
         }
 
         const newPos = currentPos.add(moveVec);
 
         // Bounds check / cleanup
-        let active: boolean = p.active;
-        
-        if (newPos.length() > 25) active = false;
-        if (technique === TechniqueType.PURPLE && newPos.length() < 0.5) active = false; // Erased
-        
-        // Remove if too small (shrunk by infinity)
+        if (newPos.length() > 30) active = false; 
         if (currentScale < 0.01) active = false;
 
-        return { ...p, position: newPos, active, scale: currentScale };
+        // FINAL NAN CHECK
+        if (isNaN(newPos.x) || isNaN(newPos.y) || isNaN(newPos.z)) {
+            active = false;
+        }
+
+        return { ...p, position: newPos, velocity: currentVelocity, active, scale: currentScale };
       }).filter(p => p.active);
     });
   });
@@ -208,41 +382,37 @@ const DynamicProjectiles = ({
   return (
     <group>
       {projectiles.map((p) => (
-        <mesh key={p.id} position={p.position} scale={p.scale ?? 1}>
-          <sphereGeometry args={[0.15, 16, 16]} />
-          <meshStandardMaterial color={p.color} emissive={p.color} emissiveIntensity={2} />
-          <Trail width={0.5 * (p.scale ?? 1)} length={3} color={new THREE.Color(p.color)} attenuation={(t) => t * t}>
-            <mesh visible={false} />
-          </Trail>
-        </mesh>
+        <Projectile key={p.id} data={p} />
       ))}
     </group>
   );
 };
 
 const FloatingParticles = ({ theme }: { theme: 'dark' | 'light' }) => {
-    const count = 100;
+    const count = theme === 'dark' ? 100 : 30;
     const mesh = useRef<THREE.InstancedMesh>(null);
     const dummy = useMemo(() => new THREE.Object3D(), []);
+    
     const particles = useMemo(() => {
         const temp = [];
-        for (let i = 0; i < count; i++) {
+        for (let i = 0; i < 100; i++) {
             const t = Math.random() * 100;
             const factor = 20 + Math.random() * 100;
             const speed = 0.01 + Math.random() / 200;
             const x = (Math.random() - 0.5) * 50;
             const y = (Math.random() - 0.5) * 50;
             const z = (Math.random() - 0.5) * 50;
-            temp.push({ t, factor, speed, x, y, z, mx: 0, my: 0 });
+            temp.push({ t, factor, speed, x, y, z });
         }
         return temp;
     }, []);
 
-    useFrame((state) => {
+    useFrame(() => {
         if (!mesh.current) return;
-        particles.forEach((particle, i) => {
-            let { t, factor, speed, x, y, z } = particle;
-            t = particle.t += speed / 2;
+        particles.slice(0, count).forEach((particle, i) => {
+            particle.t += particle.speed / 2;
+            const t = particle.t;
+            const { factor, x, y, z } = particle;
             const s = Math.cos(t);
             dummy.position.set(
                 x + Math.cos((t / 10) * factor) + (Math.sin(t * 1) * factor) / 10,
@@ -257,101 +427,32 @@ const FloatingParticles = ({ theme }: { theme: 'dark' | 'light' }) => {
         mesh.current.instanceMatrix.needsUpdate = true;
     });
 
-    const particleColor = theme === 'dark' ? '#203050' : '#cbd5e1';
+    const particleColor = theme === 'dark' ? '#203050' : '#94a3b8';
+    const opacity = theme === 'dark' ? 0.5 : 0.15;
 
     return (
         <instancedMesh ref={mesh} args={[undefined, undefined, count]}>
             <dodecahedronGeometry args={[0.2, 0]} />
-            <meshPhongMaterial color={particleColor} transparent opacity={theme === 'dark' ? 0.5 : 0.8} />
+            <meshPhongMaterial color={particleColor} transparent opacity={opacity} />
         </instancedMesh>
     );
 };
 
-const SceneEvents = ({ 
-  onClick 
-}: { 
-  onClick: (point: THREE.Vector3) => void 
+export const InfinityScene: React.FC<InfinitySceneProps> = ({ 
+  technique, 
+  spawnRate,
+  minSpeed,
+  maxSpeed,
+  theme 
 }) => {
-  return (
-    <mesh 
-      visible={false} 
-      onClick={(e) => {
-        e.stopPropagation();
-        onClick(e.point);
-      }}
-      rotation={[0, 0, 0]}
-    >
-      <planeGeometry args={[100, 100]} />
-      <meshBasicMaterial />
-    </mesh>
-  );
-};
-
-export const InfinityScene: React.FC<InfinitySceneProps> = ({ technique, isAttacking, theme }) => {
   const [projectiles, setProjectiles] = useState<ProjectileData[]>([]);
-  const lastClickTime = useRef(0);
-
-  // Auto-spawn projectiles for demo
-  useEffect(() => {
-    if (!isAttacking) return;
-    
-    // Increased interval to 2000ms to reduce object count
-    const interval = setInterval(() => {
-      const angle = Math.random() * Math.PI * 2;
-      const radius = 12;
-      const startPos = new THREE.Vector3(
-        Math.cos(angle) * radius,
-        (Math.random() - 0.5) * 10,
-        Math.sin(angle) * radius
-      );
-      
-      const direction = new THREE.Vector3(0,0,0).sub(startPos).normalize();
-      
-      const speed = 5 + Math.random() * 4; 
-      const projColor = theme === 'dark' ? '#fbbf24' : '#ef4444'; // Gold in dark, Red in light
-
-      setProjectiles(prev => [...prev, {
-        id: Date.now(),
-        position: startPos,
-        velocity: direction.multiplyScalar(speed),
-        active: true,
-        color: projColor,
-        scale: 1
-      }]);
-    }, 2000);
-
-    return () => clearInterval(interval);
-  }, [isAttacking, theme]);
-
-  const handleSceneClick = (point: THREE.Vector3) => {
-    // Throttle manual clicks to 5 per second (200ms)
-    const now = Date.now();
-    if (now - lastClickTime.current < 200) return;
-    lastClickTime.current = now;
-
-    const startPos = point.clone();
-    if (startPos.length() < 5) startPos.multiplyScalar(2);
-    
-    const direction = new THREE.Vector3(0,0,0).sub(startPos).normalize();
-    const speed = 10;
-    const projColor = theme === 'dark' ? '#00ffcc' : '#3b82f6';
-
-    setProjectiles(prev => [...prev, {
-      id: Date.now(),
-      position: startPos,
-      velocity: direction.multiplyScalar(speed),
-      active: true,
-      color: projColor,
-      scale: 1
-    }]);
-  };
 
   const bgColor = theme === 'dark' ? '#050510' : '#f8fafc';
   const textColor = theme === 'dark' ? 'white' : '#0f172a';
 
   return (
     <div className="absolute inset-0 z-0">
-      <Canvas camera={{ position: [0, 0, 14], fov: 45 }}>
+      <Canvas camera={{ position: [0, 0, 14], fov: 45 }} resize={{ scroll: false }}>
         <color attach="background" args={[bgColor]} />
         <ambientLight intensity={theme === 'dark' ? 0.5 : 0.8} />
         <pointLight position={[10, 10, 10]} intensity={1} />
@@ -360,6 +461,7 @@ export const InfinityScene: React.FC<InfinitySceneProps> = ({ technique, isAttac
         {theme === 'dark' && (
           <Stars radius={100} depth={50} count={5000} factor={4} saturation={0} fade speed={1} />
         )}
+        
         <FloatingParticles theme={theme} />
 
         <Barrier technique={technique} theme={theme} />
@@ -367,26 +469,26 @@ export const InfinityScene: React.FC<InfinitySceneProps> = ({ technique, isAttac
         <DynamicProjectiles 
           projectiles={projectiles} 
           technique={technique} 
-          setProjectiles={setProjectiles} 
+          setProjectiles={setProjectiles}
+          spawnRate={spawnRate}
+          minSpeed={minSpeed}
+          maxSpeed={maxSpeed}
+          theme={theme}
         />
 
-        <SceneEvents onClick={handleSceneClick} />
-
-        {/* Text Label in 3D Space - Using a system font or generic font to avoid load issues, stylized by geometry or simple text */}
-        <Text 
-           position={[0, -3.5, 0]} 
-           fontSize={0.5} 
-           color={textColor} 
-           anchorX="center" 
-           anchorY="middle"
-        >
-           {technique.toUpperCase()}
-        </Text>
+        <Suspense fallback={null}>
+          <Text 
+            position={[0, -3.5, 0]} 
+            fontSize={0.5} 
+            color={textColor} 
+            anchorX="center" 
+            anchorY="middle"
+            font="https://fonts.gstatic.com/s/zenantique/v5/K2FjfZRStk_uX5frg3-p91R9.woff"
+          >
+            {technique.toUpperCase()}
+          </Text>
+        </Suspense>
       </Canvas>
-      
-      <div className={`absolute bottom-20 left-1/2 -translate-x-1/2 text-xs font-serif pointer-events-none transition-colors tracking-widest ${theme === 'dark' ? 'text-white/30' : 'text-slate-400'}`}>
-        CLICK ANYWHERE TO LAUNCH ATTACK
-      </div>
     </div>
   );
 };
