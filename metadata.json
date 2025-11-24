@@ -1,0 +1,5 @@
+{
+  "name": "Limitless: The Infinity Paradox",
+  "description": "An interactive 3D visualization and AI-powered educational site explaining Satoru Gojo's Limitless technique and the concept of Infinity using React Three Fiber and Gemini API.",
+  "requestFramePermissions": []
+}
